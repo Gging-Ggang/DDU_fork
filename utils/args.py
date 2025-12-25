@@ -127,6 +127,11 @@ def training_args():
         help="Second milestone to change lr",
     )
 
+    # add rho for sam
+    parser.add_argument(
+        "--rho", type=float, default=0.05, dest="rho", help="Rho parameter for SAM",
+    )
+
     return parser
 
 

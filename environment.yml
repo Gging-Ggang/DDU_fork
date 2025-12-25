@@ -1,16 +1,18 @@
 name: environment
 channels:
-    - pytorch
-    - defaults
+  - pytorch
+  - nvidia
+  - defaults
 dependencies:
-    - python
-    - pytorch=1.7.1
-    - torchvision=0.8.2
-    - cudatoolkit=10.1
-    - tqdm
-    - tensorboard
-    - numpy
-    - scipy
-    - matplotlib
-    - seaborn
-    - scikit-learn
+  - python=3.10
+  - pytorch
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.4
+  - tqdm
+  - tensorboard
+  - numpy
+  - scipy
+  - matplotlib
+  - seaborn
+  - scikit-learn

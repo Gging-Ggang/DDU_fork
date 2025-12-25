@@ -1,0 +1,7 @@
+data/
+dataset/
+
+__pycache__/
+*.pyc
+stats_logging/
+

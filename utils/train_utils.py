@@ -11,7 +11,7 @@ loss_function_dict = {"cross_entropy": F.cross_entropy}
 
 
 def train_single_epoch(
-    epoch, model, train_loader, optimizer, device, loss_function="cross_entropy", loss_mean=False,
+    epoch, model, train_loader, optimizer, device, loss_function="cross_entropy", loss_mean=False, optimiser_name="sgd"
 ):
     """
     Util method for training a model for a single epoch.
@@ -20,21 +20,47 @@ def train_single_epoch(
     model.train()
     train_loss = 0
     num_samples = 0
+
     for batch_idx, (data, labels) in enumerate(train_loader):
         data = data.to(device)
         labels = labels.to(device)
 
-        optimizer.zero_grad()
+        # SAM
+        if optimiser_name == "sam":
+            # 1. First Step
+            logits = model(data)
+            loss = loss_function_dict[loss_function](logits, labels)
+            if loss_mean: loss = loss / len(data)
+            
+            loss.backward()
+            optimizer.first_step(zero_grad=True)
 
-        logits = model(data)
-        loss = loss_function_dict[loss_function](logits, labels)
+            # 2. Second Step
+            logits_2 = model(data)
+            loss_2 = loss_function_dict[loss_function](logits_2, labels)
+            if loss_mean: loss_2 = loss_2 / len(data)
+            
+            loss_2.backward()
+            optimizer.second_step(zero_grad=True)
+            
+            # 기록용 loss는 첫 번째 loss 사용
+            train_loss += loss.item()
 
-        if loss_mean:
-            loss = loss / len(data)
 
-        loss.backward()
-        train_loss += loss.item()
-        optimizer.step()
+
+        # Original SGD & Adam
+        else:
+            optimizer.zero_grad()
+
+            logits = model(data)
+            loss = loss_function_dict[loss_function](logits, labels)
+
+            if loss_mean:
+                loss = loss / len(data)
+
+            loss.backward()
+            train_loss += loss.item()
+            optimizer.step()
         num_samples += len(data)
 
         if batch_idx % log_interval == 0:

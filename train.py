@@ -29,6 +29,10 @@ from utils.train_utils import train_single_epoch, test_single_epoch
 # Tensorboard utilities
 from torch.utils.tensorboard import SummaryWriter
 
+# SAM
+from utils.sam import SAM
+
+
 
 dataset_num_classes = {"cifar10": 10, "cifar100": 100, "svhn": 10, "dirty_mnist": 10}
 
@@ -87,6 +91,21 @@ if __name__ == "__main__":
         )
     elif args.optimiser == "adam":
         optimizer = optim.Adam(opt_params, lr=args.learning_rate, weight_decay=args.weight_decay)
+    
+
+    # SAM
+    elif args.optimiser == "sam":
+        base_optimizer = torch.optim.SGD
+        optimizer = SAM(
+            opt_params,
+            base_optimizer,
+            lr=args.learning_rate,
+            momentum=args.momentum,
+            weight_decay=args.weight_decay,
+            rho=args.rho, # args.rho 추가
+            nesterov=args.nesterov
+        )
+
     scheduler = optim.lr_scheduler.MultiStepLR(
         optimizer, milestones=[args.first_milestone, args.second_milestone], gamma=0.1
     )
@@ -112,6 +131,7 @@ if __name__ == "__main__":
         print("Starting epoch", epoch)
         train_loss = train_single_epoch(
             epoch, net, train_loader, optimizer, device, loss_function=args.loss_function, loss_mean=args.loss_mean,
+            optimiser_name=args.optimiser # SAM
         )
 
         training_set_loss[epoch] = train_loss
