@@ -1,3 +1,12 @@
+> **Note:** This repository is a fork of the [official DDU implementation](https://github.com/omegafragger/DDU) for research purposes.
+>
+> **Major Modifications:**
+> - Added **Sharpness-Aware Minimization (SAM)** optimizer (`--opt sam`).
+> - Included `rho` parameter argument for SAM configuration.
+> - Updated environment compatibility for recent PyTorch versions.
+
+---
+
 # Deep Deterministic Uncertainty
 
 [![arXiv](https://img.shields.io/badge/stat.ML-arXiv%3A2006.08437-B31B1B.svg)](https://arxiv.org/abs/2102.11582)
