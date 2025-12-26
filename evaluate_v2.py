@@ -1,140 +1,276 @@
+"""
+Script to evaluate a single model with explicit path definition.
+Verified fixes:
+1. Removed DataParallel (Fixes feature extraction).
+2. Corrected Score Signs (Energy, Mahalanobis, kNN).
+3. Added DDU (GMM) Evaluation.
+4. Added NumpyEncoder for JSON serialization.
+5. Includes SN Hook Metadata Patch.
+"""
 import os
+import json
 import torch
 import argparse
-from torch.utils.data import DataLoader
-from sklearn.metrics import roc_auc_score, average_precision_score
+import numpy as np
+import torch.backends.cudnn as cudnn
+from sklearn.metrics import roc_auc_score
 
-# 데이터셋 및 모델 Import (기존 유지)
+# 1. Import Dataloaders
 import data.ood_detection.cifar10 as cifar10
 import data.ood_detection.cifar100 as cifar100
 import data.ood_detection.svhn as svhn
-from net.resnet import resnet50
+import data.ood_detection.mnist_ood as mnist_ood
+import data.ood_detection.tiny_imagenet as tiny_imagenet
+
+# 2. Import Networks and SN Hook for Patching
+from net.resnet import resnet50, resnet18
 from net.wide_resnet import wrn
 from net.vgg import vgg16
+import net.spectral_normalization.spectral_norm_conv_inplace as sn_lib
 
-# 유틸 (기존 + 신규)
-from utils.args import eval_args
-from utils.train_utils import model_save_name
+# =============================================================================
+# [Monkey Patch] Fix KeyError: 'weight' in SpectralNormConvLoadStateDictPreHook
+# =============================================================================
+original_load_hook = sn_lib.SpectralNormConvLoadStateDictPreHook.__call__
+
+def patched_load_hook(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+    fn = self.fn
+    version = local_metadata.get("spectral_norm_conv", {}).get(fn.name + ".version", None)
+    if (version is None or version < 1) and (prefix + fn.name) not in state_dict:
+        if (prefix + fn.name + "_orig") in state_dict:
+            return
+    return original_load_hook(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
+
+sn_lib.SpectralNormConvLoadStateDictPreHook.__call__ = patched_load_hook
+# =============================================================================
+
+# 3. Import Metrics & Utils
+from metrics.classification_metrics import test_classification_net, get_logits_labels
+from metrics.calibration_metrics import expected_calibration_error
+from metrics.uncertainty_confidence import entropy, logsumexp, confidence
+from metrics.ood_metrics import get_roc_auc
+
+from utils.geometry import get_geometry_stats
+from utils.gmm_utils import get_embeddings, gmm_fit, gmm_get_logits
 from utils.ood_scores import get_energy_score, MahalanobisScorer, KNNScorer
-from utils.gmm_utils import gmm_fit # DDU용
+from utils.temperature_scaling import ModelWithTemperature
 
-dataset_num_classes = {"cifar10": 10, "cifar100": 100, "svhn": 10}
-dataset_loader = {"cifar10": cifar10, "cifar100": cifar100, "svhn": svhn}
-models = {"resnet50": resnet50, "wide_resnet": wrn, "vgg16": vgg16}
+# =============================================================================
+# [JSON Encoder] Fix 'float32 is not JSON serializable'
+# =============================================================================
+class NumpyEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif torch.is_tensor(obj):
+            return obj.item() if obj.numel() == 1 else obj.tolist()
+        return super(NumpyEncoder, self).default(obj)
+# =============================================================================
 
-# 간단한 평가 지표 출력 함수
-def evaluate_metric(name, id_scores, ood_scores):
-    # 점수가 높을수록 ID(1), 낮을수록 OOD(0)라고 가정
+# Configuration Maps
+dataset_loader = {
+    "cifar10": cifar10, "cifar100": cifar100, "svhn": svhn,
+    "mnist": mnist_ood, "tiny_imagenet": tiny_imagenet
+}
+dataset_num_classes = {
+    "cifar10": 10, "cifar100": 100, "svhn": 10, "mnist": 10, "tiny_imagenet": 200
+}
+models = {
+    "resnet50": resnet50, "resnet18": resnet18, 
+    "wide_resnet": wrn, "vgg16": vgg16
+}
+model_to_num_dim = {
+    "resnet50": 2048, "resnet18": 512, 
+    "wide_resnet": 640, "vgg16": 512
+}
+
+def get_args():
+    parser = argparse.ArgumentParser(description="Evaluate a single model", allow_abbrev=False)
+    parser.add_argument("--checkpoint_path", type=str, required=True, help="Full path to the .model file")
+    parser.add_argument("--dataset", type=str, default="cifar10", choices=list(dataset_loader.keys()))
+    parser.add_argument("--ood_dataset", type=str, default="svhn", choices=list(dataset_loader.keys()))
+    parser.add_argument("--model", type=str, default="wide_resnet", choices=list(models.keys()))
+    parser.add_argument("--sn", action="store_true", help="Spectral Normalization")
+    parser.add_argument("--mod", action="store_true", help="Feature Modification")
+    parser.add_argument("--coeff", type=float, default=3.0, help="Coeff for mod")
+    parser.add_argument("--temp", type=float, default=1.0, help="Temperature for softmax")
+    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--gpu", action="store_true")
+    parser.add_argument("--output_dir", type=str, default=".", help="Save directory")
+    return parser.parse_args()
+
+def compute_auroc(id_scores, ood_scores):
+    # id_scores: Higher is ID
+    # ood_scores: Lower is OOD (Higher is ID)
     y_true = np.concatenate([np.ones(len(id_scores)), np.zeros(len(ood_scores))])
-    y_scores = np.concatenate([id_scores.cpu().numpy(), ood_scores.cpu().numpy()])
+    y_scores = np.concatenate([id_scores, ood_scores])
+    return roc_auc_score(y_true, y_scores)
+
+def main():
+    args = get_args()
     
-    auroc = roc_auc_score(y_true, y_scores)
-    # FPR95 구하기
-    # ... (생략 가능하거나 sklearn 등으로 구현. 여기선 AUROC만 예시로 출력)
-    print(f"[{name}] AUROC: {auroc:.4f}")
+    torch.manual_seed(args.seed)
+    cuda = args.gpu and torch.cuda.is_available()
+    device = torch.device("cuda" if cuda else "cpu")
+    
+    print(f"Target Checkpoint: {args.checkpoint_path}")
+    if not os.path.isfile(args.checkpoint_path):
+        raise FileNotFoundError(f"File NOT found: {args.checkpoint_path}")
 
-# Feature 추출 헬퍼 함수
-def extract_features(model, loader, device):
-    model.eval()
-    feats, logits, labels = [], [], []
-    with torch.no_grad():
-        for data, target in loader:
-            data = data.to(device)
-            out = model(data) # Logit 계산
-            
-            # 모델별 Feature 가져오기 (이미 구현되어 있음)
-            feat = model.feature 
-            
-            feats.append(feat.cpu())
-            logits.append(out.cpu())
-            labels.append(target)
-    return torch.cat(feats), torch.cat(logits), torch.cat(labels)
-
-if __name__ == "__main__":
-    args = eval_args().parse_args()
-    device = torch.device("cuda" if args.gpu and torch.cuda.is_available() else "cpu")
+    # 1. Load Data
     num_classes = dataset_num_classes[args.dataset]
-
-    # 1. 데이터 로더 준비 (Train, Test, OOD)
-    print("Loading Data...")
-    train_loader, test_loader = dataset_loader[args.dataset].get_train_valid_loader(
-        root=args.dataset_root, batch_size=args.batch_size, augment=False, val_size=0.1, val_seed=args.seed
-    )
-    _, ood_loader = dataset_loader[args.ood_dataset].get_train_valid_loader(
-        root=args.dataset_root, batch_size=args.batch_size, augment=False, val_size=0.1, val_seed=args.seed
-    )
-
-    # 2. 모델 로드
-    # train.py 저장 규칙에 맞춰 파일명 생성
-    saved_name = model_save_name(args.model, args.sn, args.mod, args.coeff, args.seed) + "_350.model"
-    # 경로 수정: save_loc 아래 RunX 폴더가 있다면 그 경로까지 맞춰주어야 함
-    # 예시: args.load_loc/Run1/파일명 (사용자 환경에 맞게 조정 필요)
-    load_path = os.path.join(args.load_loc, "Run1", saved_name) 
+    print(f"Dataset: ID={args.dataset}, OOD={args.ood_dataset}")
     
-    print(f"Loading Model from {load_path}")
-    net = models[args.model](
-        spectral_normalization=args.sn, mod=args.mod, coeff=args.coeff, num_classes=num_classes
+    test_loader = dataset_loader[args.dataset].get_test_loader(batch_size=args.batch_size, pin_memory=cuda)
+    
+    train_loader, val_loader = dataset_loader[args.dataset].get_train_valid_loader(
+        batch_size=args.batch_size, augment=False, val_seed=args.seed, val_size=0.1, pin_memory=cuda
     )
-    net.load_state_dict(torch.load(load_path, map_location=device))
+
+    if args.ood_dataset in ["mnist", "tiny_imagenet"]:
+        ood_test_loader = dataset_loader[args.ood_dataset].get_test_loader(batch_size=args.batch_size, root="./data")
+    else:
+        ood_test_loader = dataset_loader[args.ood_dataset].get_test_loader(batch_size=args.batch_size, pin_memory=cuda)
+
+    # 2. Build Model
+    print(f"Building Model: {args.model} (SN={args.sn}, Mod={args.mod}, Coeff={args.coeff})")
+    net = models[args.model](
+        spectral_normalization=args.sn, 
+        mod=args.mod, 
+        coeff=args.coeff, 
+        num_classes=num_classes, 
+        temp=args.temp
+    )
+    
+    # 3. Load Weights
+    print("Loading Weights...")
+    checkpoint = torch.load(args.checkpoint_path, map_location=device)
+    if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+        state_dict = checkpoint['state_dict']
+    else:
+        state_dict = checkpoint
+    
+    new_state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+    net.load_state_dict(new_state_dict)
+    
     net.to(device)
+    net.eval()
 
-    # 3. Feature 추출
-    print("Extracting Features...")
-    train_feats, train_logits, train_lbls = extract_features(net, train_loader, device)
-    test_feats, test_logits, _ = extract_features(net, test_loader, device)
-    ood_feats, ood_logits, _ = extract_features(net, ood_loader, device)
+    # 4. Standard Metrics
+    print("\n--- Standard Metrics ---")
+    (conf_matrix, accuracy, labels_list, predictions, confidences) = test_classification_net(net, test_loader, device)
+    ece = expected_calibration_error(confidences, predictions, labels_list, num_bins=15)
+    print(f"Accuracy: {accuracy:.4f}, ECE: {ece:.4f}")
 
-    print(f"Train: {train_feats.shape}, Test: {test_feats.shape}, OOD: {ood_feats.shape}")
+    # Temperature Scaling
+    t_model = ModelWithTemperature(net)
+    t_model.set_temperature(val_loader)
+    (t_conf_matrix, t_accuracy, t_labels_list, t_predictions, t_confidences) = test_classification_net(t_model, test_loader, device)
+    t_ece = expected_calibration_error(t_confidences, t_predictions, t_labels_list, num_bins=15)
+    print(f"Scaled ECE: {t_ece:.4f} (Optimal Temp: {t_model.temperature:.4f})")
 
-    # ==========================
-    # 4. OOD 스코어 계산 및 평가
-    # ==========================
+    # 5. Extract Features for OOD
+    print("\n--- Extracting Features ---")
+    dim = model_to_num_dim[args.model]
+    
+    # Using CPU to avoid OOM during feature collection
+    train_feats, train_lbls = get_embeddings(net, train_loader, num_dim=dim, dtype=torch.float, device=device, storage_device=torch.device('cpu'))
+    test_feats, _ = get_embeddings(net, test_loader, num_dim=dim, dtype=torch.float, device=device, storage_device=torch.device('cpu'))
+    ood_feats, _ = get_embeddings(net, ood_test_loader, num_dim=dim, dtype=torch.float, device=device, storage_device=torch.device('cpu'))
+    
+    test_logits, _ = get_logits_labels(net, test_loader, device)
+    ood_logits, _ = get_logits_labels(net, ood_test_loader, device)
 
-    # (1) MSP (Softmax)
-    print("\n--- MSP ---")
-    msp_id = torch.softmax(test_logits, dim=1).max(1)[0]
-    msp_ood = torch.softmax(ood_logits, dim=1).max(1)[0]
-    evaluate_metric("MSP", msp_id, msp_ood)
+    results = {
+        "accuracy": accuracy,
+        "ece": ece,
+        "t_ece": t_ece,
+        "metrics": {}
+    }
 
-    # (2) Energy
-    print("\n--- Energy ---")
-    energy_id = get_energy_score(test_logits, T=1.0)
-    energy_ood = get_energy_score(ood_logits, T=1.0)
-    evaluate_metric("Energy", energy_id, energy_ood)
+    # 6. Compute OOD Scores
+    print("\n--- Computing OOD Scores ---")
+    
+    # (1) MSP
+    (_, _, _), (_, _, _), msp_auc, _ = get_roc_auc(net, test_loader, ood_test_loader, confidence, device, confidence=True)
+    results["metrics"]["msp_auroc"] = msp_auc
+    print(f"MSP AUROC: {msp_auc:.4f}")
 
-    # (3) kNN
-    print("\n--- kNN ---")
-    knn = KNNScorer(k=50)
-    knn.fit(train_feats) # 학습 데이터로 피팅
-    knn_id = knn.score(test_feats)
-    knn_ood = knn.score(ood_feats)
-    evaluate_metric("kNN", knn_id, knn_ood)
+    # (2) Entropy
+    (_, _, _), (_, _, _), ent_auc, _ = get_roc_auc(net, test_loader, ood_test_loader, entropy, device)
+    results["metrics"]["entropy_auroc"] = ent_auc
+    print(f"Entropy AUROC: {ent_auc:.4f}")
 
-    # (4) Mahalanobis
-    print("\n--- Mahalanobis ---")
+    # (3) Energy Score
+    id_energy = get_energy_score(test_logits, T=1.0)
+    ood_energy = get_energy_score(ood_logits, T=1.0)
+    energy_auc = compute_auroc(id_energy.cpu().numpy(), ood_energy.cpu().numpy())
+    results["metrics"]["energy_auroc"] = energy_auc
+    print(f"Energy AUROC: {energy_auc:.4f} (T=1.0)")
+
+    # (4) DDU (GMM)
+    print("Fitting GMM (DDU)...")
+    try:
+        # Fit GMM on Train features
+        gmm_model, _ = gmm_fit(train_feats, train_lbls, num_classes)
+        
+        # Calculate Log-Likelihoods (Density)
+        # GMM log-prob is higher for ID data.
+        ddu_id_logits = gmm_get_logits(gmm_model, test_feats)
+        ddu_ood_logits = gmm_get_logits(gmm_model, ood_feats)
+        
+        # Marginal Log-Likelihood p(x) = log(sum(exp(log_p(x|c) + log_p(c))))
+        # Assuming uniform prior p(c), this is proportional to logsumexp of class conditional log-probs.
+        ddu_id_score = torch.logsumexp(ddu_id_logits, dim=1)
+        ddu_ood_score = torch.logsumexp(ddu_ood_logits, dim=1)
+        
+        ddu_auc = compute_auroc(ddu_id_score.numpy(), ddu_ood_score.numpy())
+        results["metrics"]["ddu_auroc"] = ddu_auc
+        print(f"DDU (GMM) AUROC: {ddu_auc:.4f}")
+    except Exception as e:
+        print(f"Error computing DDU: {e}")
+        results["metrics"]["ddu_auroc"] = 0.0
+
+    # (5) Mahalanobis
     maha = MahalanobisScorer()
     maha.fit(train_feats, train_lbls, num_classes)
     maha_id = maha.score(test_feats)
     maha_ood = maha.score(ood_feats)
-    evaluate_metric("Mahalanobis", maha_id, maha_ood)
+    maha_auc = compute_auroc(maha_id.numpy(), maha_ood.numpy())
+    results["metrics"]["maha_auroc"] = maha_auc
+    print(f"Mahalanobis AUROC: {maha_auc:.4f}")
 
-    # (5) DDU (GMM)
-    print("\n--- DDU (GMM) ---")
-    # utils/gmm_utils.py의 gmm_fit 활용
-    # Feature를 GPU로 옮겨서 피팅 (DDU 코드는 GPU 텐서를 입력으로 받음)
-    gmm, _ = gmm_fit(train_feats.to(device), train_lbls.to(device), num_classes)
+    # (6) kNN
+    knn = KNNScorer(k=50)
+    knn.fit(train_feats)
+    knn_id = knn.score(test_feats)
+    knn_ood = knn.score(ood_feats)
+    knn_auc = compute_auroc(knn_id.numpy(), knn_ood.numpy())
+    results["metrics"]["knn_auroc"] = knn_auc
+    print(f"kNN AUROC: {knn_auc:.4f}")
+
+    # 7. Geometry Analysis
+    print("\n--- Analyzing Geometry ---")
+    try:
+        geo_stats = get_geometry_stats(net, train_loader, device, num_classes)
+        results["geometry"] = geo_stats
+        print(geo_stats)
+    except Exception as e:
+        print(f"Error computing geometry stats: {e}")
+
+    # 8. Save
+    ckpt_name = os.path.basename(args.checkpoint_path)
+    save_name = f"res_{ckpt_name}_{args.ood_dataset}.json"
+    save_path = os.path.join(args.output_dir, save_name)
     
-    # GMM Score (Log Likelihood) 계산
-    # sklearn GMM 객체가 아니라면 gmm_utils의 evaluate 함수를 쓰거나,
-    # gmm이 sklearn 객체라면 아래처럼 score_samples 사용
-    from sklearn.mixture import GaussianMixture
-    if isinstance(gmm, GaussianMixture):
-        ddu_id = torch.tensor(gmm.score_samples(test_feats.numpy()))
-        ddu_ood = torch.tensor(gmm.score_samples(ood_feats.numpy()))
-    else:
-        # gmm_utils가 커스텀 구현체인 경우 해당 evaluate 함수 사용 필요
-        # 현재 파일 구조상 sklearn GMM을 반환하는 것으로 보임
-        ddu_id = torch.tensor(gmm.score_samples(test_feats.cpu().numpy()))
-        ddu_ood = torch.tensor(gmm.score_samples(ood_feats.cpu().numpy()))
-        
-    evaluate_metric("DDU", ddu_id, ddu_ood)
+    with open(save_path, "w") as f:
+        json.dump(results, f, indent=4, cls=NumpyEncoder)
+    print(f"\nSaved to: {save_path}")
+
+if __name__ == "__main__":
+    main()
