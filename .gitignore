@@ -15,7 +15,7 @@ data/tiny-imagenet-200.zip
 
 test_32x32.mat
 evaluation_log/
-
+train_sgd.log
 
 
 

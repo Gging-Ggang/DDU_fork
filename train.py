@@ -124,7 +124,15 @@ if __name__ == "__main__":
 
     training_set_loss = {}
 
-    save_name = model_save_name(args.model, args.sn, args.mod, args.coeff, args.seed)
+    save_name = model_save_name(
+        args.model, 
+        args.sn, 
+        args.mod, 
+        args.coeff, 
+        args.seed, 
+        args.optimiser, 
+        args.rho
+    )
     print("Model save name", save_name)
 
     for epoch in range(0, args.epoch):

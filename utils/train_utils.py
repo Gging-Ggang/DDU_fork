@@ -98,7 +98,7 @@ def test_single_epoch(epoch, model, test_val_loader, device, loss_function="cros
     return loss / num_samples
 
 
-def model_save_name(model_name, sn, mod, coeff, seed):
+def model_save_name(model_name, sn, mod, coeff, seed, optimizer="sgd", rho=0.0):
     if sn:
         if mod:
             strn = "_sn_" + str(coeff) + "_mod_"
@@ -110,4 +110,13 @@ def model_save_name(model_name, sn, mod, coeff, seed):
         else:
             strn = "_"
 
-    return str(model_name) + strn + str(seed)
+    # Optimizer & Rho config
+    if optimizer == "sgd":
+        opt_str = "_sgd_0"
+    elif optimizer == "sam":
+        opt_str = f"_sam_{rho}"
+    else:
+        opt_str = f"_{optimizer}_0"
+
+
+    return opt_str + str(model_name) + strn + str(seed)
