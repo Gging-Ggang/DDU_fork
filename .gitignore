@@ -2,7 +2,7 @@ __pycache__/
 *.pyc
 stats_logging/
 
-commands.txt
+
 data/cifar-10-batches-py/
 data/cifar-100-python/
 data/MNIST/

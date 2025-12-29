@@ -1,0 +1,18 @@
+검증코드
+nohup python evaluate_v2.py \
+    --checkpoint_path sam_wide_resnet_sn_3.0_mod_0_350.model \
+    --dataset cifar10 \
+    --ood_dataset cifar100 \
+    --model wide_resnet \
+    --sn \
+    --mod \
+    --coeff 3.0 \
+    --seed 0 \
+    --batch_size 128 \
+    --gpu > evaluation_log/sam_wide_resnet_sn_3.0_mod_0_350.txt 2>&1 &
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+학습코드
+nohup python train.py --seed 0 --dataset cifar10 --model wide_resnet --opt sgd -sn -mod --coeff 3.0 > train_sgd.log 2>&1 &
